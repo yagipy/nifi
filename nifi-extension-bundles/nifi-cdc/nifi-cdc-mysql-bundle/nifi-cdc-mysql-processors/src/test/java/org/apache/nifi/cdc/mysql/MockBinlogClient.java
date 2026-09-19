@@ -33,6 +33,7 @@ public class MockBinlogClient extends BinaryLogClient {
     private boolean connected;
     private boolean connectionTimeout = false;
     private boolean connectionError = false;
+    private boolean keepAliveEnabled = true;
 
     private final List<EventListener> eventListeners = new ArrayList<>();
     private final List<BinaryLogClient.LifecycleListener> lifecycleListeners = new ArrayList<>();
@@ -56,6 +57,7 @@ public class MockBinlogClient extends BinaryLogClient {
             throw new NullPointerException("Password can't be null");
         }
         connected = true;
+        lifecycleListeners.forEach(l -> l.onConnect(this));
     }
 
     @Override
@@ -108,6 +110,15 @@ public class MockBinlogClient extends BinaryLogClient {
 
     public void setConnectionError(boolean connectionError) {
         this.connectionError = connectionError;
+    }
+
+    @Override
+    public void setKeepAlive(boolean keepAlive) {
+        this.keepAliveEnabled = keepAlive;
+    }
+
+    public boolean isKeepAliveEnabled() {
+        return keepAliveEnabled;
     }
 
     @Override

@@ -756,19 +756,26 @@ public class CaptureChangeMySQL extends AbstractSessionFactoryProcessor {
 
         // If the client has been disconnected, try to reconnect
         if (!binlogClient.isConnected()) {
-            Exception e = lifecycleListener.getException();
-            // If there's no exception, the listener callback might not have been executed yet, so try again later. Otherwise clean up and start over next time
-            if (e != null) {
-                // Communications failure, disconnect and try next time
-                log.error("Binlog connector communications failure", e);
+            if (passwordProvider != null) {
+                // keepAlive is disabled, reconnect here to obtain a fresh token via setup()
                 try {
                     stop();
                 } catch (CDCException ioe) {
                     throw new ProcessException(ioe);
                 }
+            } else {
+                Exception e = lifecycleListener.getException();
+                // If there's no exception, the listener callback might not have been executed yet, so try again later. Otherwise clean up and start over next time
+                if (e != null) {
+                    // Communications failure, disconnect and try next time
+                    log.error("Binlog connector communications failure", e);
+                    try {
+                        stop();
+                    } catch (CDCException ioe) {
+                        throw new ProcessException(ioe);
+                    }
+                }
             }
-
-            // Try again later
             context.yield();
             return;
         }
@@ -849,6 +856,11 @@ public class CaptureChangeMySQL extends AbstractSessionFactoryProcessor {
 
                 connectedHost = hosts.get(currentHost);
                 binlogClient = createBinlogClient(connectedHost.getHostString(), connectedHost.getPort(), username, password);
+                if (passwordProvider != null) {
+                    // Disable the keepAlive reconnect thread so it does not reconnect with a stale token.
+                    // Reconnection is handled by onTrigger(), which calls setup() to obtain a fresh token each time.
+                    binlogClient.setKeepAlive(false);
+                }
             }
 
             // Add an event listener and lifecycle listener for binlog and client events, respectively
@@ -913,7 +925,7 @@ public class CaptureChangeMySQL extends AbstractSessionFactoryProcessor {
 
         if (passwordProvider != null && passwordRequestContext != null) {
             passwordRequestContext = DatabasePasswordRequestContext.builder()
-                    .jdbcUrl(passwordRequestContext.getJdbcUrl())
+                    .jdbcUrl(JDBC_URL_FORMAT.formatted(connectedHost.getHostString() + ":" + connectedHost.getPort()))
                     .driverClassName(passwordRequestContext.getDriverClassName())
                     .databaseUser(passwordRequestContext.getDatabaseUser())
                     .connectionProperties(jdbcConnectionProperties)
@@ -1376,9 +1388,9 @@ public class CaptureChangeMySQL extends AbstractSessionFactoryProcessor {
             getLogger().trace("Creating a new JDBC connection.");
             final Properties props = new Properties();
             props.putAll(connectionProps);
-            final String password = passwordSupplier.get();
-            if (password != null) {
-                props.put("password", password);
+            final String resolvedPassword = passwordSupplier.get();
+            if (resolvedPassword != null) {
+                props.put("password", resolvedPassword);
             }
             connection = DriverManager.getConnection(connectionUrl, props);
             return connection;

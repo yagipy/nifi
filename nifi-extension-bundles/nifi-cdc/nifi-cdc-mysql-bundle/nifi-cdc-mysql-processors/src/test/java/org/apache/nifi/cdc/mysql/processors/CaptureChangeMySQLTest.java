@@ -57,6 +57,8 @@ import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -82,11 +84,14 @@ import javax.net.ssl.SSLContext;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -235,11 +240,13 @@ public class CaptureChangeMySQLTest {
         verify(passwordProvider, atLeastOnce()).getPassword(any(DatabasePasswordRequestContext.class));
     }
 
-    @Test
-    public void testPasswordProviderEmptyTokenThrowsProcessException(@Mock DatabasePasswordProvider passwordProvider) throws InitializationException {
+    @ParameterizedTest
+    @NullAndEmptySource
+    public void testPasswordProviderInvalidTokenThrowsProcessException(final char[] token,
+            @Mock DatabasePasswordProvider passwordProvider) throws InitializationException {
         final String identifier = DatabasePasswordProvider.class.getName();
         when(passwordProvider.getIdentifier()).thenReturn(identifier);
-        when(passwordProvider.getPassword(any())).thenReturn(new char[0]);
+        when(passwordProvider.getPassword(any())).thenReturn(token);
         testRunner.addControllerService(identifier, passwordProvider);
         testRunner.enableControllerService(passwordProvider);
 
@@ -256,10 +263,10 @@ public class CaptureChangeMySQLTest {
     }
 
     @Test
-    public void testPasswordProviderNullTokenThrowsProcessException(@Mock DatabasePasswordProvider passwordProvider) throws InitializationException {
+    public void testPasswordProviderDisablesKeepAlive(@Mock DatabasePasswordProvider passwordProvider) throws InitializationException {
         final String identifier = DatabasePasswordProvider.class.getName();
         when(passwordProvider.getIdentifier()).thenReturn(identifier);
-        when(passwordProvider.getPassword(any())).thenReturn(null);
+        when(passwordProvider.getPassword(any())).thenReturn("token".toCharArray());
         testRunner.addControllerService(identifier, passwordProvider);
         testRunner.enableControllerService(passwordProvider);
 
@@ -270,9 +277,122 @@ public class CaptureChangeMySQLTest {
         testRunner.setProperty(CaptureChangeMySQL.PASSWORD_SOURCE, CaptureChangeMySQL.PasswordSource.PASSWORD_PROVIDER);
         testRunner.setProperty(CaptureChangeMySQL.DB_PASSWORD_PROVIDER, identifier);
 
-        final AssertionError assertionError = assertThrows(AssertionError.class, () -> testRunner.run());
-        assertInstanceOf(ProcessException.class, assertionError.getCause());
-        assertEquals("Database Password Provider returned an empty password", assertionError.getCause().getMessage());
+        testRunner.run(1, false, true);
+
+        assertFalse(client.isKeepAliveEnabled(),
+                "keepAlive must be disabled when using DatabasePasswordProvider to prevent reconnection with a stale IAM token");
+    }
+
+    @Test
+    public void testPasswordProviderFetchesFreshTokenAfterCleanDisconnect(@Mock DatabasePasswordProvider passwordProvider) throws InitializationException {
+        final String identifier = DatabasePasswordProvider.class.getName();
+        when(passwordProvider.getIdentifier()).thenReturn(identifier);
+        when(passwordProvider.getPassword(any())).thenReturn("token".toCharArray());、、
+        testRunner.addControllerService(identifier, passwordProvider);
+        testRunner.enableControllerService(passwordProvider);
+
+        testRunner.setProperty(CaptureChangeMySQL.HOSTS, LOCAL_HOST_DEFAULT_PORT);
+        testRunner.setProperty(CaptureChangeMySQL.DRIVER_LOCATION, DRIVER_LOCATION);
+        testRunner.setProperty(CaptureChangeMySQL.USERNAME, ROOT_USER);
+        testRunner.setProperty(CaptureChangeMySQL.CONNECT_TIMEOUT, CONNECT_TIMEOUT);
+        testRunner.setProperty(CaptureChangeMySQL.PASSWORD_SOURCE, CaptureChangeMySQL.PasswordSource.PASSWORD_PROVIDER);
+        testRunner.setProperty(CaptureChangeMySQL.DB_PASSWORD_PROVIDER, identifier);
+
+        // Initial connection
+        testRunner.run(1, false, true);
+
+        // Simulate clean disconnect (FIN): update connected state and fire onDisconnect on all registered listeners
+        client.disconnect();
+        client.getLifecycleListeners().forEach(listener -> listener.onDisconnect(client));
+
+        // Processor detects disconnect, calls stop(), then yields
+        testRunner.run(1, false, false);
+
+        // Next trigger: setup() fetches fresh token and reconnects
+        testRunner.run(1, false, false);
+
+        verify(passwordProvider, atLeast(2)).getPassword(any(DatabasePasswordRequestContext.class));
+    }
+
+    @Test
+    public void testPasswordProviderFetchesFreshTokenAfterCommunicationFailure(@Mock DatabasePasswordProvider passwordProvider) throws InitializationException {
+        final String identifier = DatabasePasswordProvider.class.getName();
+        when(passwordProvider.getIdentifier()).thenReturn(identifier);
+        when(passwordProvider.getPassword(any())).thenReturn("token".toCharArray());
+        testRunner.addControllerService(identifier, passwordProvider);
+        testRunner.enableControllerService(passwordProvider);
+
+        testRunner.setProperty(CaptureChangeMySQL.HOSTS, LOCAL_HOST_DEFAULT_PORT);
+        testRunner.setProperty(CaptureChangeMySQL.DRIVER_LOCATION, DRIVER_LOCATION);
+        testRunner.setProperty(CaptureChangeMySQL.USERNAME, ROOT_USER);
+        testRunner.setProperty(CaptureChangeMySQL.CONNECT_TIMEOUT, CONNECT_TIMEOUT);
+        testRunner.setProperty(CaptureChangeMySQL.PASSWORD_SOURCE, CaptureChangeMySQL.PasswordSource.PASSWORD_PROVIDER);
+        testRunner.setProperty(CaptureChangeMySQL.DB_PASSWORD_PROVIDER, identifier);
+
+        // Initial connection
+        testRunner.run(1, false, true);
+
+        // Simulate RST: fire onCommunicationFailure then onDisconnect (matches listenForEventPackets() catch/finally sequence)
+        final IOException connectionReset = new IOException("Connection reset by peer");
+        client.disconnect();
+        client.getLifecycleListeners().forEach(listener -> listener.onCommunicationFailure(client, connectionReset));
+        client.getLifecycleListeners().forEach(listener -> listener.onDisconnect(client));
+
+        // Processor detects disconnect, calls stop(), then yields
+        testRunner.run(1, false, false);
+
+        // Next trigger: setup() fetches fresh token and reconnects
+        testRunner.run(1, false, false);
+
+        verify(passwordProvider, atLeast(2)).getPassword(any(DatabasePasswordRequestContext.class));
+    }
+
+    @Test
+    public void testCommunicationFailureWithPlainPasswordTriggersReconnect() {
+        testRunner.setProperty(CaptureChangeMySQL.HOSTS, LOCAL_HOST_DEFAULT_PORT);
+        testRunner.setProperty(CaptureChangeMySQL.DRIVER_LOCATION, DRIVER_LOCATION);
+        testRunner.setProperty(CaptureChangeMySQL.USERNAME, ROOT_USER);
+        testRunner.setProperty(CaptureChangeMySQL.CONNECT_TIMEOUT, CONNECT_TIMEOUT);
+
+        // Initial connection
+        testRunner.run(1, false, true);
+
+        // Simulate RST: fire onCommunicationFailure then onDisconnect
+        final IOException connectionReset = new IOException("Connection reset by peer");
+        client.disconnect();
+        client.getLifecycleListeners().forEach(listener -> listener.onCommunicationFailure(client, connectionReset));
+        client.getLifecycleListeners().forEach(listener -> listener.onDisconnect(client));
+
+        // Processor detects disconnect, calls stop(), then yields
+        testRunner.run(1, false, false);
+
+        // Reconnects on next trigger
+        testRunner.run(1, false, false);
+
+        assertTrue(client.isConnected());
+    }
+
+    @Test
+    public void testCleanDisconnectWithPlainPasswordDoesNotTriggerReconnect() {
+        testRunner.setProperty(CaptureChangeMySQL.HOSTS, LOCAL_HOST_DEFAULT_PORT);
+        testRunner.setProperty(CaptureChangeMySQL.DRIVER_LOCATION, DRIVER_LOCATION);
+        testRunner.setProperty(CaptureChangeMySQL.USERNAME, ROOT_USER);
+        testRunner.setProperty(CaptureChangeMySQL.CONNECT_TIMEOUT, CONNECT_TIMEOUT);
+
+        // Initial connection
+        testRunner.run(1, false, true);
+
+        // Simulate clean disconnect (FIN): fire onDisconnect
+        client.disconnect();
+        client.getLifecycleListeners().forEach(listener -> listener.onDisconnect(client));
+
+        // Processor detects no exception, yields
+        testRunner.run(1, false, false);
+
+        // No reconnect on next trigger
+        testRunner.run(1, false, false);
+
+        assertFalse(client.isConnected());
     }
 
     @Test
